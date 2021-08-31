@@ -1,76 +1,207 @@
-# Jupyter Notebook
+define([
+	'require',
+	'jquery',
+	'base/js/events',
+	'base/js/namespace',
+	'base/js/utils',
+	'notebook/js/textcell',
+	'services/config',
+	'codemirror/lib/codemirror',
+	'./typo/typo'
+], function (
+	require,
+	$,
+	events,
+	Jupyter,
+	utils,
+	textcell,
+	configmod,
+	CodeMirror,
+	Typo
+) {
+	'use strict';
 
-[![Google Group](https://img.shields.io/badge/-Google%20Group-lightgrey.svg)](https://groups.google.com/forum/#!forum/jupyter)
-[![Build Status](https://travis-ci.org/jupyter/notebook.svg?branch=master)](https://travis-ci.org/jupyter/notebook)
-[![Documentation Status](https://readthedocs.org/projects/jupyter-notebook/badge/?version=latest)](https://jupyter-notebook.readthedocs.io/en/latest/?badge=latest)
-[![codecov](https://codecov.io/gh/jupyter/notebook/branch/master/graph/badge.svg)](https://codecov.io/gh/jupyter/notebook)
+	// parameters (potentially) stored in config. This object gets updated on config load.
+	var params = {
+		enable_on_load : true,
+		add_toolbar_button : true,
+		lang_code : 'en_US',
+		dic_url : 'https://cdn.jsdelivr.net/codemirror.spell-checker/latest/en_US.dic',
+		aff_url : 'https://cdn.jsdelivr.net/codemirror.spell-checker/latest/en_US.aff',
+	};
 
-The Jupyter notebook is a web-based notebook environment for interactive
-computing.
+	// Initialize data globally to reduce memory consumption
+	var log_prefix = '[spellchecker]';
+	var dict_load_promise;
+	var typo_dict;
 
-![Jupyter notebook example](docs/resources/running_code_med.png "Jupyter notebook example")
+	/**
+	 * Load the dictionaries from the param-specified urls
+	 *
+	 * @return {Promise} - a promise which fulfils when the dictionaries have
+	 *                     been ajax-loaded
+	 */
+	function load_dictionary () {
+		if (dict_load_promise === undefined) {
+			dict_load_promise = Promise.all([
+				params.aff_url ? $.ajax({
+					url: require.toUrl(params.aff_url),
+					dataType: 'text'
+				}) : Promise.resolve(''),
+				params.dic_url ? $.ajax({
+					url: require.toUrl(params.dic_url),
+					dataType: 'text'
+				}) : Promise.resolve('')
+			]).then(function (values) {
+				if (typo_dict === undefined) {
+					typo_dict = new Typo(params.lang_code, values[0], values[1], {
+						platform: 'any'
+					});
+				}
+				return typo_dict;
+			});
+		}
+		return dict_load_promise;
+	}
 
-### Notice
-Please note that this repository is currently maintained by a skeleton crew of maintainers from the Jupyter community. We encourage users to transition to JupyterLab, where more immediate support can occur. Our approach moving forward will be:
+	/**
+	 * rx_word_char defines characters in words,
+	 * rx_non_word_char defines the opposite.
+	 * Defining both allows a simplified mode token function.
+	 * The single quote can be in words, as an apostrophe for contractions like
+	 * "isn't", so it's treated as a word character, then stripped from the
+	 * start & finish before checking the word against the dictionary.
+	 */
+	var rx_word_char     = /[^-\[\]{}():\/!;&@$£%§<>"*+=?.,~\\^|_`#±\s\t]/;
+	var rx_non_word_char =  /[-\[\]{}():\/!;&@$£%§<>"*+=?.,~\\^|_`#±\s\t]/;
 
-1. To maintain the security of the Jupyter Notebook. That means security-related issues and pull requests are our highest priority.
-2. To address JupyterLab [feature parity issues](https://github.com/jupyterlab/jupyterlab/issues?q=is%3Aopen+is%3Aissue+label%3A%22tag%3AFeature+Parity%22). As part of this effort, we are also working on a better [notebook-only experience](https://github.com/jupyterlab/jupyterlab/issues/8450) in JupyterLab for users who prefer the UI of the classic Jupyter Notebook.
-3. To be responsive to the hard work of community members who have opened pull requests. We are triaging these PRs. We cannot support or maintain new features at this time, but we welcome security and other sustainability fixes.
+	function define_mode (original_mode_spec) {
+		if (original_mode_spec.indexOf('spellcheck_') === 0) {
+			return original_mode_spec;
+		}
 
-If you have an open pull request with a new feature or if you were planning to open one, please consider shipping it as a [notebook extension](https://jupyter-notebook.readthedocs.io/en/stable/extending/) instead.
+		var new_mode_spec = 'spellcheck_' + original_mode_spec;
+		CodeMirror.defineMode(new_mode_spec, function (config) {
+			var spellchecker_overlay = {
+				name: new_mode_spec,
+				token: function (stream, state) {
+					if (stream.eatWhile(rx_word_char)) {
+						// strip leading and trailing single quotes
+						var word = stream.current().replace(/(^')|('$)/g, '');
+						// we don't consider a set of digits as a word to spellcheck
+						if (!word.match(/^\d+$/) && !typo_dict.check(word)) {
+							return 'spell-error';
+						}
+					}
+					stream.eatWhile(rx_non_word_char);
+					return null;
+				}
+			};
+			return CodeMirror.overlayMode(
+				CodeMirror.getMode(config, original_mode_spec), spellchecker_overlay, true);
+		});
+		return new_mode_spec;
+	}
 
-##### Alternatives to contributing to `notebook`
-Additionally, please consider whether your contribution would be appropriate for either the underlying server for Jupyter front-ends, [jupyter_server](https://github.com/jupyter/jupyter_server) or in the [JupyterLab front-end](https://github.com/jupyterlab/jupyterlab).
+	/**
+	 * Given a codemirror mode specification string, return the corresponding
+	 * string with spellcheck enabled/disabled by adding/removing 'spellcheck_'
+	 * from the beginning where necessary
+	 *
+	 * @param {String} mode - a CodeMirror mode specification string
+	 * @param {Boolean} spellcheck_on - whether a spellcheck mode should be returned
+	 * @return {String} - the appropriate CodeMirror mode string
+	 */
+	function toggle_mode (mode, spellcheck_on) {
+		var new_mode = mode.substr(Boolean(mode.match('^spellcheck_')) ? 11 : 0);
+		if (spellcheck_on) {
+			return define_mode(new_mode);
+		}
+		else {
+			return new_mode;
+		}
+	}
 
-### Jupyter notebook, the language-agnostic evolution of IPython notebook
-Jupyter notebook is a language-agnostic HTML notebook application for
-Project Jupyter. In 2015, Jupyter notebook was released as a part of
-The Big Split™ of the IPython codebase. IPython 3 was the last major monolithic
-release containing both language-agnostic code, such as the *IPython notebook*,
-and language specific code, such as the *IPython kernel for Python*. As
-computing spans across many languages, Project Jupyter will continue to develop the
-language-agnostic **Jupyter notebook** in this repo and with the help of the
-community develop language specific kernels which are found in their own
-discrete repos.
-[[The Big Split™ announcement](https://blog.jupyter.org/the-big-split-9d7b88a031a7)]
-[[Jupyter Ascending blog post](https://blog.jupyter.org/jupyter-ascending-1bf5b362d97e)]
+	/**
+	 * Toggle spelling checking overlay usage for all text cells
+	 *
+	 * @param {Boolean} set_on - whether spellcheck mode should be toggled on.
+	 *     If undefined, it's just toggled from current state
+	 * @return {Boolean} - whether the mode was set on
+	 */
+	function toggle_spellcheck (set_on) {
+		set_on = (set_on !== undefined) ? set_on : (params.enable_on_load = !params.enable_on_load);
+		// Change defaults for new cells:
+		textcell.MarkdownCell.options_default.cm_config.mode = toggle_mode(
+			textcell.MarkdownCell.options_default.cm_config.mode, set_on
+		);
+		// And change any existing cells:
+		Jupyter.notebook.get_cells().forEach(function (cell, idx, array) {
+			if (cell instanceof textcell.TextCell) {
+				var new_mode = toggle_mode(cell.code_mirror.getOption('mode'), set_on);
+				cell.code_mirror.setOption('mode', new_mode);
+			}
+		});
+		// update button class
+		$('#spellchecker_btn').toggleClass('active', set_on);
+		console.log(log_prefix, 'toggled ' + (set_on ? 'on' : 'off'));
+		return set_on;
+	}
 
-## Installation
-You can find the installation documentation for the
-[Jupyter platform, on ReadTheDocs](https://jupyter.readthedocs.io/en/latest/install.html).
-The documentation for advanced usage of Jupyter notebook can be found
-[here](https://jupyter-notebook.readthedocs.io/en/latest/).
+	/**
+	 * Add a button to the jupyter toolbar for toggling spellcheck overlay
+	 */
+	function add_toolbar_buttons () {
+		return Jupyter.toolbar.add_buttons_group([{
+			label : 'Toggle spell checking on markdown cells',
+			icon : 'fa-check',
+			callback : function (evt) {
+				toggle_spellcheck();
+				setTimeout(function () {
+					evt.currentTarget.blur();
+				}, 100);
+			},
+			id : 'spellchecker_btn'
+		}]);
+	}
 
-For a local installation, make sure you have
-[pip installed](https://pip.readthedocs.io/en/stable/installing/) and run:
+	/**
+	 * Add a <link> for a css file to the document head
+	 *
+	 * @param {String} url - the url of the css file, which will be passed
+	 *      through require.toUrl, to enable relative urls
+	 * @return {jQuery} - a jQuery object containing the link which was added
+	 */
+	function add_css (url) {
+		return $('<link/>').attr({
+			type : 'text/css',
+			rel : 'stylesheet',
+			href : require.toUrl(url)
+		}).appendTo('head');
+	}
 
-    $ pip install notebook
+	/**
+	 * Initializes the extension
+	 */
+	function load_jupyter_extension () {
+		add_css('./main.css');
 
-## Usage - Running Jupyter notebook
+		var base_url = utils.get_body_data('baseUrl');
+		var config = new configmod.ConfigSection('notebook', { base_url : base_url });
+		config.load();
+		config.loaded
+			.then(function () {
+				$.extend(true, params, config.data.spellchecker); // update params
+				if (params.add_toolbar_button) {
+					add_toolbar_buttons();
+				}
+				toggle_spellcheck(params.enable_on_load);
+			})
+			.then(load_dictionary);
+	}
 
-### Running in a local installation
-
-Launch with:
-
-    $ jupyter notebook
-
-### Running in a remote installation
-
-You need some configuration before starting Jupyter notebook remotely. See [Running a notebook server](https://jupyter-notebook.readthedocs.io/en/stable/public_server.html).
-
-## Development Installation
-
-See [`CONTRIBUTING.rst`](CONTRIBUTING.rst) for how to set up a local development installation.
-
-## Contributing
-
-If you are interested in contributing to the project, see [`CONTRIBUTING.rst`](CONTRIBUTING.rst).
-
-## Resources
-- [Project Jupyter website](https://jupyter.org)
-- [Online Demo at jupyter.org/try](https://jupyter.org/try)
-- [Documentation for Jupyter notebook](https://jupyter-notebook.readthedocs.io/en/latest/) [[PDF](https://media.readthedocs.org/pdf/jupyter-notebook/latest/jupyter-notebook.pdf)]
-- [Korean Version of Installation](https://github.com/ChungJooHo/Jupyter_Kor_doc/)
-- [Documentation for Project Jupyter](https://jupyter.readthedocs.io/en/latest/index.html) [[PDF](https://media.readthedocs.org/pdf/jupyter/latest/jupyter.pdf)]
-- [Issues](https://github.com/jupyter/notebook/issues)
-- [Technical support - Jupyter Google Group](https://groups.google.com/forum/#!forum/jupyter)
+	return {
+		load_jupyter_extension : load_jupyter_extension,
+		load_ipython_extension : load_jupyter_extension,
+	};
+});
